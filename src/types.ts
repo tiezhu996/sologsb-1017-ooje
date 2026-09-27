@@ -83,10 +83,36 @@ export interface Version {
   script: Script
 }
 
+export type ChangeRequestStatus = 'pending' | 'approved' | 'rejected'
+
+export interface SceneFieldChange {
+  field: keyof Scene
+  label: string
+  beforeText: string
+  afterText: string
+  after: Scene[keyof Scene]
+}
+
+export interface ChangeRequest {
+  id: string
+  sceneId: string
+  sceneNumber: string
+  sceneSlug: string
+  submitter: string
+  note: string
+  changes: SceneFieldChange[]
+  status: ChangeRequestStatus
+  createdAt: string
+  resolvedAt?: string
+  resolver?: string
+  rejectReason?: string
+}
+
 export interface ContinuityState {
   script: Script
   reviews: Record<string, WarningReview>
   versions: Version[]
+  changeRequests: ChangeRequest[]
   updatedAt: string
 }
 

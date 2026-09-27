@@ -1,22 +1,88 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sampleScript } from './sample'
-import type { Character, ContinuityState, DiffItem, Prop, Reply, Scene, Script, Version, Wardrobe, WarningItem, WarningReview } from './types'
+import type { ChangeRequest, Character, ContinuityState, DiffItem, Prop, Reply, Scene, SceneFieldChange, Script, Version, Wardrobe, WarningItem, WarningReview } from './types'
 
 const STORAGE_KEY = 'sologsb-1017-continuity-v1'
 const clone = <T,>(value: T): T => structuredClone(value)
 const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+
+export const sceneFieldLabels: Record<string, string> = {
+  number: '场号',
+  slug: '场名',
+  synopsis: '摘要',
+  intExt: '内外景',
+  location: '地点',
+  dayNight: '日夜',
+  storyTime: '故事时间',
+  pageLength: '页数',
+  revision: '修订色',
+  status: '状态',
+  reason: '修改理由',
+  characterIds: '出场角色',
+  propIds: '使用道具',
+  costumes: '服装搭配'
+}
+
+export const revisionLabels: Record<Scene['revision'], string> = {
+  white: '白纸', blue: '蓝', pink: '粉', yellow: '黄', green: '绿', goldenrod: '金菊', buff: '浅黄', salmon: '鲑粉', cherry: '樱桃'
+}
+
+export const sceneStatusLabels: Record<Scene['status'], string> = { draft: '草稿', review: '待审', locked: '锁定' }
+
+export function formatSceneField(script: Script, field: keyof Scene, value: Scene[keyof Scene]): string {
+  if (value === undefined || value === null || value === '') return '空'
+  if (field === 'characterIds') {
+    const names = (value as string[]).map((itemId) => script.characters.find((item) => item.id === itemId)?.name ?? '未知角色')
+    return names.length ? names.join('、') : '无'
+  }
+  if (field === 'propIds') {
+    const names = (value as string[]).map((itemId) => script.props.find((item) => item.id === itemId)?.name ?? '未知道具')
+    return names.length ? names.join('、') : '无'
+  }
+  if (field === 'costumes') {
+    const pairs = Object.entries(value as Record<string, string>).map(([characterId, wardrobeId]) => {
+      const character = script.characters.find((item) => item.id === characterId)?.name ?? '未知角色'
+      const wardrobe = script.wardrobes.find((item) => item.id === wardrobeId)?.name ?? '未知服装'
+      return `${character}→${wardrobe}`
+    })
+    return pairs.length ? pairs.join('、') : '无'
+  }
+  if (field === 'revision') return revisionLabels[value as Scene['revision']] ?? String(value)
+  if (field === 'status') return sceneStatusLabels[value as Scene['status']] ?? String(value)
+  if (field === 'pageLength') return `${value} 页`
+  return String(value)
+}
+
+export function buildSceneChanges(script: Script, scene: Scene, edits: Partial<Scene>): SceneFieldChange[] {
+  const changes: SceneFieldChange[] = []
+  ;(Object.keys(edits) as Array<keyof Scene>).forEach((field) => {
+    const before = scene[field]
+    const after = edits[field]
+    if (after === undefined || JSON.stringify(before) === JSON.stringify(after)) return
+    changes.push({
+      field,
+      label: sceneFieldLabels[field] ?? String(field),
+      beforeText: formatSceneField(script, field, before),
+      afterText: formatSceneField(script, field, after),
+      after: clone(after)
+    })
+  })
+  return changes
+}
 
 function initialState(): ContinuityState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {
       const parsed = JSON.parse(raw) as ContinuityState
-      if (parsed.script?.scenes?.length) return parsed
+      if (parsed.script?.scenes?.length) {
+        return { ...parsed, changeRequests: Array.isArray(parsed.changeRequests) ? parsed.changeRequests : [] }
+      }
     }
   } catch {
     // Ignore an invalid local draft and restore the bundled example.
   }
-  return { script: clone(sampleScript), reviews: {}, versions: [], updatedAt: new Date().toISOString() }
+  return { script: clone(sampleScript), reviews: {}, versions: [], changeRequests: [], updatedAt: new Date().toISOString() }
 }
 
 export function deriveWarnings(script: Script): WarningItem[] {
@@ -100,18 +166,8 @@ export function deriveWarnings(script: Script): WarningItem[] {
 }
 
 export function diffScript(base: Script, current: Script): DiffItem[] {
-  const fields: Array<{ key: keyof Scene; label: string }> = [
-    { key: 'slug', label: '场名' },
-    { key: 'synopsis', label: '摘要' },
-    { key: 'intExt', label: '内外景' },
-    { key: 'location', label: '地点' },
-    { key: 'dayNight', label: '日夜' },
-    { key: 'storyTime', label: '故事时间' },
-    { key: 'pageLength', label: '页数' },
-    { key: 'revision', label: '修订色' },
-    { key: 'status', label: '状态' },
-    { key: 'reason', label: '修改理由' }
-  ]
+  const diffKeys: Array<keyof Scene> = ['slug', 'synopsis', 'intExt', 'location', 'dayNight', 'storyTime', 'pageLength', 'revision', 'status', 'reason']
+  const fields = diffKeys.map((key) => ({ key, label: sceneFieldLabels[key] }))
   const result: DiffItem[] = []
   const sceneKey = (scene: Scene) => `${scene.number}|${scene.slug}`
   const baseByKey = new Map(base.scenes.map((scene) => [sceneKey(scene), scene]))
@@ -188,14 +244,16 @@ export function useContinuityStore() {
   const updateScene = useCallback((sceneId: string, field: keyof Scene, value: Scene[keyof Scene]) => {
     mutate((script) => {
       const scene = script.scenes.find((item) => item.id === sceneId)
-      if (scene) (scene as unknown as Record<string, unknown>)[field] = value
+      // Locked scenes only change through an approved change request.
+      if (!scene || scene.status === 'locked') return
+      ;(scene as unknown as Record<string, unknown>)[field] = value
     })
   }, [mutate])
 
   const toggleSceneRelation = useCallback((sceneId: string, field: 'characterIds' | 'propIds', itemId: string) => {
     mutate((script) => {
       const scene = script.scenes.find((item) => item.id === sceneId)
-      if (!scene) return
+      if (!scene || scene.status === 'locked') return
       const values = scene[field]
       scene[field] = values.includes(itemId) ? values.filter((value) => value !== itemId) : [...values, itemId]
     })
@@ -204,7 +262,7 @@ export function useContinuityStore() {
   const setCostume = useCallback((sceneId: string, characterId: string, wardrobeId: string) => {
     mutate((script) => {
       const scene = script.scenes.find((item) => item.id === sceneId)
-      if (!scene) return
+      if (!scene || scene.status === 'locked') return
       if (!wardrobeId) delete scene.costumes[characterId]
       else scene.costumes[characterId] = wardrobeId
     })
@@ -215,6 +273,7 @@ export function useContinuityStore() {
       const index = script.scenes.findIndex((scene) => scene.id === sceneId)
       const target = index + direction
       if (index < 0 || target < 0 || target >= script.scenes.length) return
+      if (script.scenes[index].status === 'locked') return
       const [scene] = script.scenes.splice(index, 1)
       script.scenes.splice(target, 0, scene)
     })
@@ -234,8 +293,9 @@ export function useContinuityStore() {
 
   const deleteScene = useCallback((sceneId: string) => {
     if (state.script.scenes.length <= 1) return
+    if (state.script.scenes.find((scene) => scene.id === sceneId)?.status === 'locked') return
     mutate((script) => { script.scenes = script.scenes.filter((scene) => scene.id !== sceneId) })
-  }, [mutate, state.script.scenes.length])
+  }, [mutate, state.script.scenes])
 
   const addCharacter = useCallback(() => {
     mutate((script) => {
@@ -306,6 +366,67 @@ export function useContinuityStore() {
     }))
   }, [])
 
+  const submitChangeRequest = useCallback((sceneId: string, submitter: string, note: string, changes: SceneFieldChange[]) => {
+    if (!changes.length) return ''
+    const scene = state.script.scenes.find((item) => item.id === sceneId)
+    if (!scene) return ''
+    const request: ChangeRequest = {
+      id: id('req'),
+      sceneId,
+      sceneNumber: scene.number,
+      sceneSlug: scene.slug,
+      submitter: submitter.trim() || '未署名',
+      note: note.trim(),
+      changes,
+      status: 'pending',
+      createdAt: new Date().toISOString()
+    }
+    setState((previous) => ({ ...previous, changeRequests: [request, ...previous.changeRequests], updatedAt: new Date().toISOString() }))
+    return request.id
+  }, [state.script.scenes])
+
+  const approveChangeRequest = useCallback((requestId: string, resolver: string) => {
+    setState((previous) => {
+      const request = previous.changeRequests.find((item) => item.id === requestId)
+      if (!request || request.status !== 'pending') return previous
+      const sceneExists = previous.script.scenes.some((scene) => scene.id === request.sceneId)
+      if (!sceneExists) return previous
+      const next = clone(previous.script)
+      const scene = next.scenes.find((item) => item.id === request.sceneId)
+      if (scene) {
+        request.changes.forEach((change) => {
+          (scene as unknown as Record<string, unknown>)[change.field] = clone(change.after)
+        })
+      }
+      undoRef.current.push(clone(previous.script))
+      if (undoRef.current.length > 80) undoRef.current.shift()
+      redoRef.current = []
+      return {
+        ...previous,
+        script: next,
+        changeRequests: previous.changeRequests.map((item) =>
+          item.id === requestId
+            ? { ...item, status: 'approved' as const, resolvedAt: new Date().toISOString(), resolver: resolver.trim() || '审阅人' }
+            : item
+        ),
+        updatedAt: new Date().toISOString()
+      }
+    })
+  }, [])
+
+  const rejectChangeRequest = useCallback((requestId: string, resolver: string, reason: string) => {
+    if (!reason.trim()) return
+    setState((previous) => ({
+      ...previous,
+      changeRequests: previous.changeRequests.map((item) =>
+        item.id === requestId && item.status === 'pending'
+          ? { ...item, status: 'rejected' as const, resolvedAt: new Date().toISOString(), resolver: resolver.trim() || '审阅人', rejectReason: reason.trim() }
+          : item
+      ),
+      updatedAt: new Date().toISOString()
+    }))
+  }, [])
+
   const createVersion = useCallback((name: string) => {
     const version: Version = { id: id('version'), name: name.trim() || `版本 ${state.versions.length + 1}`, createdAt: new Date().toISOString(), script: clone(state.script) }
     setState((previous) => ({ ...previous, versions: [version, ...previous.versions] }))
@@ -342,6 +463,9 @@ export function useContinuityStore() {
     updateWardrobe,
     setReviewStatus,
     addReply,
+    submitChangeRequest,
+    approveChangeRequest,
+    rejectChangeRequest,
     createVersion,
     restoreVersion,
     undo,
