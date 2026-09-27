@@ -1,22 +1,66 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sampleScript } from './sample'
-import type { Character, ContinuityState, DiffItem, Prop, Reply, Scene, Script, Version, Wardrobe, WarningItem, WarningReview } from './types'
+import type { ChangeRequest, Character, ContinuityState, DiffItem, Prop, Reply, RevisionColor, Scene, ScenePatch, ScenePatchField, Script, Version, Wardrobe, WarningItem, WarningReview } from './types'
 
 const STORAGE_KEY = 'sologsb-1017-continuity-v1'
 const clone = <T,>(value: T): T => structuredClone(value)
 const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+
+export const SCENE_FIELD_LABELS: Record<ScenePatchField, string> = {
+  number: '场号',
+  slug: '场名',
+  synopsis: '摘要',
+  intExt: '内外景',
+  location: '地点',
+  dayNight: '日夜',
+  storyTime: '故事时间',
+  pageLength: '页数',
+  revision: '修订色',
+  reason: '修改理由',
+  characterIds: '出场角色',
+  propIds: '道具',
+  costumes: '服装'
+}
+
+const REVISION_LABELS: Record<RevisionColor, string> = {
+  white: '白纸', blue: '蓝', pink: '粉', yellow: '黄', green: '绿', goldenrod: '金菊', buff: '浅黄', salmon: '鲑粉', cherry: '樱桃'
+}
+
+/** Render a scene field value as readable text for change requests (改前 / 改后). */
+export function formatSceneFieldValue(field: ScenePatchField, value: Scene[keyof Scene], script: Script): string {
+  if (field === 'characterIds') {
+    const names = (value as string[]).map((characterId) => script.characters.find((item) => item.id === characterId)?.name ?? characterId)
+    return names.length ? names.join('、') : '（无）'
+  }
+  if (field === 'propIds') {
+    const names = (value as string[]).map((propId) => script.props.find((item) => item.id === propId)?.name ?? propId)
+    return names.length ? names.join('、') : '（无）'
+  }
+  if (field === 'costumes') {
+    const entries = Object.entries(value as Record<string, string>)
+    if (!entries.length) return '（无）'
+    return entries.map(([characterId, wardrobeId]) => {
+      const character = script.characters.find((item) => item.id === characterId)?.name ?? characterId
+      const wardrobe = script.wardrobes.find((item) => item.id === wardrobeId)?.name ?? '未指定'
+      return `${character}：${wardrobe}`
+    }).join('；')
+  }
+  if (field === 'revision') return REVISION_LABELS[value as RevisionColor] ?? String(value)
+  const text = String(value ?? '')
+  return text.trim() ? text : '（空）'
+}
 
 function initialState(): ContinuityState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {
       const parsed = JSON.parse(raw) as ContinuityState
-      if (parsed.script?.scenes?.length) return parsed
+      if (parsed.script?.scenes?.length) return { ...parsed, changeRequests: parsed.changeRequests ?? [] }
     }
   } catch {
     // Ignore an invalid local draft and restore the bundled example.
   }
-  return { script: clone(sampleScript), reviews: {}, versions: [], updatedAt: new Date().toISOString() }
+  return { script: clone(sampleScript), reviews: {}, versions: [], changeRequests: [], updatedAt: new Date().toISOString() }
 }
 
 export function deriveWarnings(script: Script): WarningItem[] {
@@ -306,6 +350,83 @@ export function useContinuityStore() {
     }))
   }, [])
 
+  const submitChangeRequest = useCallback((sceneId: string, patches: ScenePatch[], submittedBy: string, note: string) => {
+    if (!patches.length) return
+    setState((previous) => {
+      const scene = previous.script.scenes.find((item) => item.id === sceneId)
+      if (!scene || scene.status !== 'locked') return previous
+      const now = new Date().toISOString()
+      const existing = previous.changeRequests.find((item) => item.sceneId === sceneId && item.status === 'pending')
+      if (existing) {
+        // One pending request per scene: merge new patches into it, before-values stay the current working draft.
+        const merged = existing.patches.map((patch) => patches.find((item) => item.field === patch.field) ?? patch)
+        patches.forEach((patch) => { if (!merged.some((item) => item.field === patch.field)) merged.push(patch) })
+        return {
+          ...previous,
+          changeRequests: previous.changeRequests.map((item) => item.id === existing.id
+            ? { ...item, patches: merged, submittedBy: submittedBy.trim() || item.submittedBy, note: note.trim() || item.note, sceneNumber: scene.number, sceneSlug: scene.slug, createdAt: now }
+            : item),
+          updatedAt: now
+        }
+      }
+      const request: ChangeRequest = {
+        id: id('request'),
+        sceneId,
+        sceneNumber: scene.number,
+        sceneSlug: scene.slug,
+        patches: clone(patches),
+        submittedBy: submittedBy.trim() || '未署名',
+        note: note.trim(),
+        createdAt: now,
+        status: 'pending',
+        reviewedBy: '',
+        reviewedAt: '',
+        rejectReason: ''
+      }
+      return { ...previous, changeRequests: [request, ...previous.changeRequests], updatedAt: now }
+    })
+  }, [])
+
+  const withdrawChangeRequest = useCallback((requestId: string) => {
+    setState((previous) => ({
+      ...previous,
+      changeRequests: previous.changeRequests.filter((item) => !(item.id === requestId && item.status === 'pending')),
+      updatedAt: new Date().toISOString()
+    }))
+  }, [])
+
+  const approveChangeRequest = useCallback((requestId: string, reviewer: string) => {
+    const request = state.changeRequests.find((item) => item.id === requestId)
+    if (!request || request.status !== 'pending') return
+    // Write the approved patches into the working draft; warnings re-derive from the new script.
+    mutate((script) => {
+      const scene = script.scenes.find((item) => item.id === request.sceneId)
+      if (!scene) return
+      request.patches.forEach((patch) => { (scene as unknown as Record<string, unknown>)[patch.field] = clone(patch.value) })
+    })
+    const now = new Date().toISOString()
+    setState((previous) => ({
+      ...previous,
+      changeRequests: previous.changeRequests.map((item) => item.id === requestId
+        ? { ...item, status: 'approved' as const, reviewedBy: reviewer.trim() || '审阅人', reviewedAt: now }
+        : item),
+      updatedAt: now
+    }))
+  }, [state.changeRequests, mutate])
+
+  const rejectChangeRequest = useCallback((requestId: string, reviewer: string, reason: string) => {
+    if (!reason.trim()) return
+    // The working draft never received the change, so rejecting simply drops the request.
+    const now = new Date().toISOString()
+    setState((previous) => ({
+      ...previous,
+      changeRequests: previous.changeRequests.map((item) => item.id === requestId && item.status === 'pending'
+        ? { ...item, status: 'rejected' as const, reviewedBy: reviewer.trim() || '审阅人', reviewedAt: now, rejectReason: reason.trim() }
+        : item),
+      updatedAt: now
+    }))
+  }, [])
+
   const createVersion = useCallback((name: string) => {
     const version: Version = { id: id('version'), name: name.trim() || `版本 ${state.versions.length + 1}`, createdAt: new Date().toISOString(), script: clone(state.script) }
     setState((previous) => ({ ...previous, versions: [version, ...previous.versions] }))
@@ -320,7 +441,7 @@ export function useContinuityStore() {
 
   const reset = useCallback(() => {
     mutate((script) => { Object.assign(script, clone(sampleScript)) })
-    setState((previous) => ({ ...previous, reviews: {} }))
+    setState((previous) => ({ ...previous, reviews: {}, changeRequests: [] }))
   }, [mutate])
 
   return {
@@ -342,6 +463,10 @@ export function useContinuityStore() {
     updateWardrobe,
     setReviewStatus,
     addReply,
+    submitChangeRequest,
+    withdrawChangeRequest,
+    approveChangeRequest,
+    rejectChangeRequest,
     createVersion,
     restoreVersion,
     undo,

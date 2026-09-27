@@ -36,17 +36,19 @@ import {
   Storage,
   Difference,
   Keyboard,
+  Lock,
   NavigateBefore,
   NavigateNext,
   Redo,
   Reply,
   Save,
   Search,
+  Send,
   Undo,
   WarningAmber
 } from '@mui/icons-material'
-import { diffScript, useContinuityStore } from './store'
-import type { RevisionColor, Scene, WarningItem, WarningStatus } from './types'
+import { SCENE_FIELD_LABELS, diffScript, formatSceneFieldValue, useContinuityStore } from './store'
+import type { ChangeRequest, RevisionColor, Scene, ScenePatch, ScenePatchField, WarningItem, WarningStatus } from './types'
 
 const revisionOptions: Array<{ value: RevisionColor; label: string; color: string }> = [
   { value: 'white', label: '白纸', color: '#f7f5ee' },
@@ -70,7 +72,7 @@ function Highlight({ text, query }: { text: string; query: string }) {
   return <>{text.slice(0, index)}<mark>{text.slice(index, index + query.length)}</mark>{text.slice(index + query.length)}</>
 }
 
-function SceneCard({ scene, query, active, onOpen }: { scene: Scene; query: string; active: boolean; onOpen: () => void }) {
+function SceneCard({ scene, query, active, pendingRequest, onOpen }: { scene: Scene; query: string; active: boolean; pendingRequest: boolean; onOpen: () => void }) {
   return (
     <Paper
       component="article"
@@ -88,6 +90,7 @@ function SceneCard({ scene, query, active, onOpen }: { scene: Scene; query: stri
           <Chip size="small" label={`${scene.intExt}. ${scene.location}`} />
           <Chip size="small" label={scene.dayNight} variant="outlined" />
           <Chip size="small" label={scene.status === 'locked' ? '锁定' : scene.status === 'review' ? '待审' : '草稿'} color={scene.status === 'review' ? 'warning' : 'default'} />
+          {pendingRequest && <Chip size="small" color="error" variant="outlined" label="有修改待批" />}
           <span className={`revision-dot revision-${scene.revision}`} title={`修订色：${scene.revision}`} />
         </Stack>
         <Typography className="outline-synopsis"><Highlight text={scene.synopsis || '尚未填写场景摘要。'} query={query} /></Typography>
@@ -106,7 +109,7 @@ export default function App() {
   const store = useContinuityStore()
   const { state, warnings } = store
   const [selectedSceneId, setSelectedSceneId] = useState(state.script.scenes[0]?.id ?? '')
-  const [view, setView] = useState<'outline' | 'detail' | 'warnings' | 'versions'>('outline')
+  const [view, setView] = useState<'outline' | 'detail' | 'warnings' | 'requests' | 'versions'>('outline')
   const [query, setQuery] = useState('')
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [libraryTab, setLibraryTab] = useState('characters')
@@ -116,11 +119,20 @@ export default function App() {
   const [warningFilter, setWarningFilter] = useState<'all' | WarningStatus>('all')
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({})
   const [shortcutOpen, setShortcutOpen] = useState(false)
+  const [draftEdits, setDraftEdits] = useState<Record<string, Partial<Scene>>>({})
+  const [submitterName, setSubmitterName] = useState('')
+  const [requestNote, setRequestNote] = useState('')
+  const [reviewDialog, setReviewDialog] = useState<{ mode: 'approve' | 'reject'; requestId: string } | null>(null)
+  const [reviewerName, setReviewerName] = useState('')
+  const [rejectReason, setRejectReason] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
 
   const selectedScene = state.script.scenes.find((scene) => scene.id === selectedSceneId) ?? state.script.scenes[0]
   const pendingWarnings = warnings.filter((warning) => (state.reviews[warning.id]?.status ?? 'pending') === 'pending')
   const visibleWarnings = warnings.filter((warning) => warningFilter === 'all' || (state.reviews[warning.id]?.status ?? 'pending') === warningFilter)
+  const pendingRequests = state.changeRequests.filter((request) => request.status === 'pending')
+  const historyRequests = state.changeRequests.filter((request) => request.status !== 'pending')
+  const reviewDialogRequest = reviewDialog ? state.changeRequests.find((request) => request.id === reviewDialog.requestId) ?? null : null
   const selectedVersion = state.versions.find((version) => version.id === selectedVersionId) ?? state.versions[0]
   const diff = useMemo(() => selectedVersion ? diffScript(selectedVersion.script, state.script) : [], [selectedVersion, state.script])
   const searchResults = useMemo(() => {
@@ -157,7 +169,7 @@ export default function App() {
         setQuery('')
       } else if (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown') && selectedScene) {
         event.preventDefault()
-        store.moveScene(selectedScene.id, event.key === 'ArrowUp' ? -1 : 1)
+        if (selectedScene.status !== 'locked') store.moveScene(selectedScene.id, event.key === 'ArrowUp' ? -1 : 1)
       } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
         if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return
         const index = state.script.scenes.findIndex((scene) => scene.id === selectedScene?.id)
@@ -184,6 +196,74 @@ export default function App() {
     setVersionDialog(false)
   }
 
+  function setSceneDraft(field: ScenePatchField, value: Scene[keyof Scene]) {
+    if (!selectedScene) return
+    setDraftEdits((previous) => {
+      const current = { ...(previous[selectedScene.id] ?? {}) } as Record<string, unknown>
+      if (JSON.stringify(selectedScene[field]) === JSON.stringify(value)) delete current[field]
+      else current[field] = value
+      return { ...previous, [selectedScene.id]: current as Partial<Scene> }
+    })
+  }
+
+  function changeSceneField(field: ScenePatchField, value: Scene[keyof Scene]) {
+    if (!selectedScene) return
+    if (selectedScene.status !== 'locked') store.updateScene(selectedScene.id, field, value)
+    else setSceneDraft(field, value)
+  }
+
+  function toggleRelation(field: 'characterIds' | 'propIds', itemId: string) {
+    if (!selectedScene) return
+    if (selectedScene.status !== 'locked') {
+      store.toggleSceneRelation(selectedScene.id, field, itemId)
+      return
+    }
+    const current = (draftEdits[selectedScene.id]?.[field] ?? selectedScene[field]) as string[]
+    const next = current.includes(itemId) ? current.filter((value) => value !== itemId) : [...current, itemId]
+    setSceneDraft(field, next)
+  }
+
+  function changeCostume(characterId: string, wardrobeId: string) {
+    if (!selectedScene) return
+    if (selectedScene.status !== 'locked') {
+      store.setCostume(selectedScene.id, characterId, wardrobeId)
+      return
+    }
+    const current = { ...(draftEdits[selectedScene.id]?.costumes ?? selectedScene.costumes) }
+    if (!wardrobeId) delete current[characterId]
+    else current[characterId] = wardrobeId
+    setSceneDraft('costumes', current)
+  }
+
+  function clearDraft() {
+    if (!selectedScene) return
+    setDraftEdits((previous) => ({ ...previous, [selectedScene.id]: {} }))
+    setRequestNote('')
+  }
+
+  function submitDraftRequest() {
+    if (!selectedScene) return
+    const edits = draftEdits[selectedScene.id] ?? {}
+    const patches: ScenePatch[] = (Object.keys(edits) as ScenePatchField[]).flatMap((field) => {
+      const value = edits[field] as Scene[keyof Scene]
+      const before = formatSceneFieldValue(field, selectedScene[field], state.script)
+      const after = formatSceneFieldValue(field, value, state.script)
+      return before === after ? [] : [{ field, label: SCENE_FIELD_LABELS[field], before, after, value }]
+    })
+    if (!patches.length) return
+    store.submitChangeRequest(selectedScene.id, patches, submitterName || state.script.writer, requestNote)
+    clearDraft()
+  }
+
+  function confirmReviewDialog() {
+    if (!reviewDialog) return
+    if (reviewDialog.mode === 'approve') store.approveChangeRequest(reviewDialog.requestId, reviewerName)
+    else store.rejectChangeRequest(reviewDialog.requestId, reviewerName, rejectReason)
+    setReviewDialog(null)
+    setReviewerName('')
+    setRejectReason('')
+  }
+
   function renderOutline() {
     return (
       <Box>
@@ -196,7 +276,16 @@ export default function App() {
           <Button variant="contained" startIcon={<Add />} onClick={() => { const sceneId = store.addScene(); setSelectedSceneId(sceneId); setView('detail') }}>新增场景</Button>
         </Stack>
         <Box className="outline-grid">
-          {state.script.scenes.map((scene) => <SceneCard key={scene.id} scene={scene} query={query} active={scene.id === selectedScene?.id} onOpen={() => openScene(scene.id)} />)}
+          {state.script.scenes.map((scene) => (
+            <SceneCard
+              key={scene.id}
+              scene={scene}
+              query={query}
+              active={scene.id === selectedScene?.id}
+              pendingRequest={state.changeRequests.some((request) => request.sceneId === scene.id && request.status === 'pending')}
+              onOpen={() => openScene(scene.id)}
+            />
+          ))}
         </Box>
       </Box>
     )
@@ -206,6 +295,15 @@ export default function App() {
     if (!selectedScene) return null
     const sceneWarnings = warnings.filter((warning) => warning.sceneId === selectedScene.id)
     const locked = selectedScene.status === 'locked'
+    const edits = draftEdits[selectedScene.id] ?? {}
+    const effectiveScene: Scene = { ...selectedScene, ...edits }
+    const sceneRequest = state.changeRequests.find((request) => request.sceneId === selectedScene.id && request.status === 'pending')
+    const editEntries = (Object.keys(edits) as ScenePatchField[]).flatMap((field) => {
+      const value = edits[field] as Scene[keyof Scene]
+      const before = formatSceneFieldValue(field, selectedScene[field], state.script)
+      const after = formatSceneFieldValue(field, value, state.script)
+      return before === after ? [] : [{ field, label: SCENE_FIELD_LABELS[field], before, after }]
+    })
     return (
       <Box className="detail-page">
         <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" gap={2} alignItems={{ md: 'flex-start' }}>
@@ -213,24 +311,30 @@ export default function App() {
             <Typography className="eyebrow">SCENE {selectedScene.number}</Typography>
             <input
               className="scene-slug-input"
-              value={selectedScene.slug}
-              disabled={locked}
+              value={effectiveScene.slug}
               aria-label="场景名"
-              onChange={(event) => store.updateScene(selectedScene.id, 'slug', event.target.value)}
+              onChange={(event) => changeSceneField('slug', event.target.value)}
             />
             <Stack direction="row" gap={1} mt={1} flexWrap="wrap">
               <Chip label={`${sceneWarnings.length} 条检查`} color={sceneWarnings.length ? 'warning' : 'success'} size="small" />
               <Chip label={`${selectedScene.pageLength.toFixed(2)} 页`} size="small" variant="outlined" />
               <Chip label={selectedScene.storyTime} size="small" variant="outlined" />
-              {locked && <Chip icon={<Block />} label="场景已锁定" size="small" />}
+              {locked && <Chip icon={<Lock />} label="场景已锁定" size="small" />}
+              {sceneRequest && <Chip color="error" variant="outlined" size="small" label={`${sceneRequest.patches.length} 项修改待批`} onClick={() => setView('requests')} />}
             </Stack>
           </Box>
           <Stack direction="row" gap={1} flexWrap="wrap">
-            <Button variant="outlined" onClick={() => store.moveScene(selectedScene.id, -1)}>上移</Button>
-            <Button variant="outlined" onClick={() => store.moveScene(selectedScene.id, 1)}>下移</Button>
-            <Button color="error" onClick={() => { store.deleteScene(selectedScene.id); setView('outline') }}>删除</Button>
+            <Button variant="outlined" disabled={locked} onClick={() => store.moveScene(selectedScene.id, -1)}>上移</Button>
+            <Button variant="outlined" disabled={locked} onClick={() => store.moveScene(selectedScene.id, 1)}>下移</Button>
+            <Button color="error" disabled={locked} onClick={() => { store.deleteScene(selectedScene.id); setView('outline') }}>删除</Button>
           </Stack>
         </Stack>
+
+        {locked && (
+          <Alert severity="info" icon={<Lock />} sx={{ mt: 2 }}>
+            本场已锁版，改动不会直接写进工作稿，也不会影响连续性检查；提交后进入待批区，审阅人批准才生效。
+          </Alert>
+        )}
 
         {sceneWarnings.length > 0 && (
           <Alert severity="warning" icon={<WarningAmber />} sx={{ mt: 2 }}>
@@ -242,32 +346,32 @@ export default function App() {
         <Paper className="editor-paper" elevation={0}>
           <Typography variant="h6">场次信息</Typography>
           <Box className="form-grid">
-            <TextField label="场号" value={selectedScene.number} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'number', event.target.value)} />
-            <TextField select label="内外景" value={selectedScene.intExt} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'intExt', event.target.value as Scene['intExt'])}>
+            <TextField label="场号" value={effectiveScene.number} onChange={(event) => changeSceneField('number', event.target.value)} />
+            <TextField select label="内外景" value={effectiveScene.intExt} onChange={(event) => changeSceneField('intExt', event.target.value as Scene['intExt'])}>
               {['INT', 'EXT', 'INT/EXT'].map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
             </TextField>
-            <TextField label="地点" value={selectedScene.location} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'location', event.target.value)} />
-            <TextField select label="日夜" value={selectedScene.dayNight} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'dayNight', event.target.value)}>
+            <TextField label="地点" value={effectiveScene.location} onChange={(event) => changeSceneField('location', event.target.value)} />
+            <TextField select label="日夜" value={effectiveScene.dayNight} onChange={(event) => changeSceneField('dayNight', event.target.value)}>
               {dayNightOptions.map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
             </TextField>
-            <TextField label="故事时间" value={selectedScene.storyTime} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'storyTime', event.target.value)} />
-            <TextField type="number" label="页数" value={selectedScene.pageLength} disabled={locked} inputProps={{ step: 0.25, min: 0 }} onChange={(event) => store.updateScene(selectedScene.id, 'pageLength', Number(event.target.value))} />
+            <TextField label="故事时间" value={effectiveScene.storyTime} onChange={(event) => changeSceneField('storyTime', event.target.value)} />
+            <TextField type="number" label="页数" value={effectiveScene.pageLength} inputProps={{ step: 0.25, min: 0 }} onChange={(event) => changeSceneField('pageLength', Number(event.target.value))} />
             <TextField select label="场次状态" value={selectedScene.status} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'status', event.target.value as Scene['status'])}>
               <MenuItem value="draft">草稿</MenuItem>
               <MenuItem value="review">待审</MenuItem>
               <MenuItem value="locked">锁定</MenuItem>
             </TextField>
-            <TextField select label="修订颜色" value={selectedScene.revision} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'revision', event.target.value as RevisionColor)}>
+            <TextField select label="修订颜色" value={effectiveScene.revision} onChange={(event) => changeSceneField('revision', event.target.value as RevisionColor)}>
               {revisionOptions.map((option) => <MenuItem key={option.value} value={option.value}><span className={`revision-swatch revision-${option.value}`} />{option.label}</MenuItem>)}
             </TextField>
-            <TextField className="span-2" multiline minRows={3} label="场景摘要" value={selectedScene.synopsis} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'synopsis', event.target.value)} />
-            <TextField className="span-2" multiline minRows={2} label="修改理由 / 作者说明" value={selectedScene.reason} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'reason', event.target.value)} />
+            <TextField className="span-2" multiline minRows={3} label="场景摘要" value={effectiveScene.synopsis} onChange={(event) => changeSceneField('synopsis', event.target.value)} />
+            <TextField className="span-2" multiline minRows={2} label="修改理由 / 作者说明" value={effectiveScene.reason} onChange={(event) => changeSceneField('reason', event.target.value)} />
           </Box>
         </Paper>
 
         <Paper className="editor-paper" elevation={0}>
           <Stack direction="row" justifyContent="space-between" alignItems="center">
-            <Box><Typography variant="h6">出场关系</Typography><Typography variant="body2" color="text.secondary">勾选本场出现的角色和道具，服装直接绑定到角色。</Typography></Box>
+            <Box><Typography variant="h6">出场关系</Typography><Typography variant="body2" color="text.secondary">勾选本场出现的角色和道具，服装直接绑定到角色。{locked && '锁定场次的勾选改动同样需要提交申请。'}</Typography></Box>
           </Stack>
           <Box className="relation-grid">
             <Box>
@@ -277,9 +381,9 @@ export default function App() {
                   <Chip
                     key={character.id}
                     label={`${character.name} / ${character.actor}`}
-                    color={selectedScene.characterIds.includes(character.id) ? 'primary' : 'default'}
-                    variant={selectedScene.characterIds.includes(character.id) ? 'filled' : 'outlined'}
-                    onClick={() => !locked && store.toggleSceneRelation(selectedScene.id, 'characterIds', character.id)}
+                    color={effectiveScene.characterIds.includes(character.id) ? 'primary' : 'default'}
+                    variant={effectiveScene.characterIds.includes(character.id) ? 'filled' : 'outlined'}
+                    onClick={() => toggleRelation('characterIds', character.id)}
                   />
                 ))}
               </Box>
@@ -291,17 +395,17 @@ export default function App() {
                   <Chip
                     key={prop.id}
                     label={prop.name}
-                    color={selectedScene.propIds.includes(prop.id) ? 'secondary' : 'default'}
-                    variant={selectedScene.propIds.includes(prop.id) ? 'filled' : 'outlined'}
-                    onClick={() => !locked && store.toggleSceneRelation(selectedScene.id, 'propIds', prop.id)}
+                    color={effectiveScene.propIds.includes(prop.id) ? 'secondary' : 'default'}
+                    variant={effectiveScene.propIds.includes(prop.id) ? 'filled' : 'outlined'}
+                    onClick={() => toggleRelation('propIds', prop.id)}
                   />
                 ))}
               </Box>
             </Box>
           </Box>
-          {selectedScene.characterIds.length > 0 && (
+          {effectiveScene.characterIds.length > 0 && (
             <Box className="costume-grid">
-              {selectedScene.characterIds.map((characterId) => {
+              {effectiveScene.characterIds.map((characterId) => {
                 const character = state.script.characters.find((item) => item.id === characterId)
                 const options = state.script.wardrobes.filter((wardrobe) => wardrobe.characterId === characterId)
                 return (
@@ -309,9 +413,8 @@ export default function App() {
                     key={characterId}
                     select
                     label={`${character?.name ?? '角色'}服装`}
-                    value={selectedScene.costumes[characterId] ?? ''}
-                    disabled={locked}
-                    onChange={(event) => store.setCostume(selectedScene.id, characterId, event.target.value)}
+                    value={effectiveScene.costumes[characterId] ?? ''}
+                    onChange={(event) => changeCostume(characterId, event.target.value)}
                   >
                     <MenuItem value="">未指定</MenuItem>
                     {options.map((wardrobe) => <MenuItem key={wardrobe.id} value={wardrobe.id}>{wardrobe.name} · {wardrobe.timePeriods.join('/')}</MenuItem>)}
@@ -321,6 +424,60 @@ export default function App() {
             </Box>
           )}
         </Paper>
+
+        {locked && sceneRequest && (
+          <Paper className="editor-paper request-existing" elevation={0}>
+            <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" gap={1}>
+              <Box>
+                <Typography variant="h6">待批修改申请</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  {sceneRequest.submittedBy} 提交于 {new Date(sceneRequest.createdAt).toLocaleString('zh-CN')}，共 {sceneRequest.patches.length} 项字段
+                </Typography>
+              </Box>
+              <Stack direction="row" gap={1}>
+                <Button onClick={() => setView('requests')}>前往待批区</Button>
+                <Button color="inherit" onClick={() => store.withdrawChangeRequest(sceneRequest.id)}>撤回申请</Button>
+              </Stack>
+            </Stack>
+            <Box className="request-patch-list">
+              {sceneRequest.patches.map((patch) => (
+                <Box key={patch.field} className="diff-row">
+                  <Chip size="small" label={`场景 ${sceneRequest.sceneNumber}`} />
+                  <strong>{patch.label}</strong>
+                  <span className="diff-before">{patch.before}</span>
+                  <span className="diff-arrow">→</span>
+                  <span className="diff-after">{patch.after}</span>
+                </Box>
+              ))}
+            </Box>
+          </Paper>
+        )}
+
+        {locked && editEntries.length > 0 && (
+          <Paper className="editor-paper request-draft-panel" elevation={0}>
+            <Typography variant="h6">{sceneRequest ? '并入待批申请的新改动' : `待提交的修改申请 · ${editEntries.length} 项字段`}</Typography>
+            <Typography variant="body2" color="text.secondary">以下改动暂存在本机，提交后才进入审阅流程；工作稿与连续性检查当前仍以锁定值为准。</Typography>
+            <Box className="request-patch-list">
+              {editEntries.map((entry) => (
+                <Box key={entry.field} className="diff-row">
+                  <Chip size="small" label={`场景 ${selectedScene.number}`} />
+                  <strong>{entry.label}</strong>
+                  <span className="diff-before">{entry.before}</span>
+                  <span className="diff-arrow">→</span>
+                  <span className="diff-after">{entry.after}</span>
+                </Box>
+              ))}
+            </Box>
+            <Box className="request-draft-form">
+              <TextField label="提交人" placeholder={state.script.writer} value={submitterName} onChange={(event) => setSubmitterName(event.target.value)} />
+              <TextField className="span-2" multiline minRows={1} maxRows={4} label="调整说明（可选）" placeholder="例如：现场道具改为棕色，服装组已同步" value={requestNote} onChange={(event) => setRequestNote(event.target.value)} />
+              <Stack direction="row" gap={1} justifyContent="flex-end">
+                <Button color="inherit" onClick={clearDraft}>清空暂存</Button>
+                <Button variant="contained" startIcon={<Send />} onClick={submitDraftRequest}>{sceneRequest ? '更新待批申请' : '提交修改申请'}</Button>
+              </Stack>
+            </Box>
+          </Paper>
+        )}
       </Box>
     )
   }
@@ -406,6 +563,84 @@ export default function App() {
             )
           })}
           {!visibleWarnings.length && <Alert severity="success">当前筛选下没有连续性问题。</Alert>}
+        </Stack>
+      </Box>
+    )
+  }
+
+  function renderRequests() {
+    const renderCard = (request: ChangeRequest) => {
+      const scene = state.script.scenes.find((item) => item.id === request.sceneId)
+      const sceneGone = request.status === 'pending' && !scene
+      return (
+        <Paper key={request.id} className={`request-panel status-${request.status}`} elevation={0}>
+          <Box className="request-panel-head">
+            <Box flex={1}>
+              <Stack direction="row" gap={1} alignItems="center" flexWrap="wrap">
+                <Typography variant="h6">场景 {request.sceneNumber} · {request.sceneSlug}</Typography>
+                {scene ? (
+                  <Chip size="small" label="打开场次" variant="outlined" onClick={() => openScene(request.sceneId)} />
+                ) : (
+                  <Chip size="small" label="场次已删除" color="error" variant="outlined" />
+                )}
+                {request.status === 'pending' && <Chip size="small" color="warning" label="待批" />}
+                {request.status === 'approved' && <Chip size="small" color="success" label="已批准" />}
+                {request.status === 'rejected' && <Chip size="small" variant="outlined" label="已驳回" />}
+              </Stack>
+              <Typography variant="body2" color="text.secondary" mt={.5}>
+                {request.submittedBy} 提交于 {new Date(request.createdAt).toLocaleString('zh-CN')}
+                {request.reviewedAt && ` · ${request.reviewedBy} 于 ${new Date(request.reviewedAt).toLocaleString('zh-CN')}${request.status === 'approved' ? '批准' : '驳回'}`}
+              </Typography>
+              {request.note && <Typography mt={1}>调整说明：{request.note}</Typography>}
+            </Box>
+            {request.status === 'pending' && (
+              <Stack direction="row" gap={1} className="request-actions">
+                <Button size="small" variant="contained" color="success" startIcon={<CheckCircle />} disabled={sceneGone} onClick={() => setReviewDialog({ mode: 'approve', requestId: request.id })}>批准</Button>
+                <Button size="small" variant="outlined" color="error" startIcon={<Block />} onClick={() => setReviewDialog({ mode: 'reject', requestId: request.id })}>驳回</Button>
+              </Stack>
+            )}
+          </Box>
+          <Box className="request-patch-list">
+            {request.patches.map((patch) => (
+              <Box key={patch.field} className="diff-row">
+                <Chip size="small" label={`场景 ${request.sceneNumber}`} />
+                <strong>{patch.label}</strong>
+                <span className="diff-before">{patch.before}</span>
+                <span className="diff-arrow">→</span>
+                <span className="diff-after">{patch.after}</span>
+              </Box>
+            ))}
+          </Box>
+          {request.status === 'rejected' && (
+            <Alert severity="error" sx={{ mt: 1.5 }}>驳回说明：{request.rejectReason}（工作稿保持改前值，此申请已丢弃）</Alert>
+          )}
+          {request.status === 'approved' && (
+            <Alert severity="success" sx={{ mt: 1.5 }}>改动已写入工作稿，连续性检查已按新值重算。</Alert>
+          )}
+        </Paper>
+      )
+    }
+    return (
+      <Box>
+        <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" gap={2} mb={2}>
+          <Box>
+            <Typography className="eyebrow">LOCKED SCENE CHANGE REQUESTS</Typography>
+            <Typography variant="h4">待批区</Typography>
+            <Typography color="text.secondary">锁定场次的改动先停在这里，工作稿与连续性检查不受影响；批准后写入并重算，驳回则整条丢弃。</Typography>
+          </Box>
+          <Chip color="warning" label={`${pendingRequests.length} 条待批`} />
+        </Stack>
+        <Stack gap={1.5}>
+          {pendingRequests.map(renderCard)}
+          {!pendingRequests.length && <Alert severity="success">没有待批的修改申请，锁定场次的工作稿目前全部一致。</Alert>}
+          {historyRequests.length > 0 && (
+            <>
+              <Divider sx={{ my: 1 }}>
+                <Typography variant="body2" color="text.secondary">已处理 · {historyRequests.length}</Typography>
+              </Divider>
+              {historyRequests.map(renderCard)}
+            </>
+          )}
         </Stack>
       </Box>
     )
@@ -501,6 +736,7 @@ export default function App() {
         <span>{store.saveStatus === 'saved' ? '● 已保存到本机' : '◌ 正在保存'}</span>
         <span>{state.script.scenes.length} 场 / {state.script.scenes.reduce((total, scene) => total + scene.pageLength, 0).toFixed(2)} 页</span>
         <span className={pendingWarnings.length ? 'attention' : ''}>{pendingWarnings.length} 条问题待审</span>
+        <span className={pendingRequests.length ? 'attention' : ''}>{pendingRequests.length} 条锁定场修改待批</span>
         <span>所有修改自动保存在浏览器本地</span>
       </Box>
 
@@ -526,6 +762,7 @@ export default function App() {
         <Tab value="outline" label="大纲视图" />
         <Tab value="detail" label="场景详情" />
         <Tab value="warnings" label={<Badge badgeContent={pendingWarnings.length} color="warning"><span className="tab-label">警告审阅</span></Badge>} />
+        <Tab value="requests" label={<Badge badgeContent={pendingRequests.length} color="error"><span className="tab-label">待批区</span></Badge>} />
         <Tab value="versions" label={<Badge badgeContent={state.versions.length} color="secondary"><span className="tab-label">版本差异</span></Badge>} />
       </Tabs>
 
@@ -550,6 +787,7 @@ export default function App() {
         {view === 'outline' && renderOutline()}
         {view === 'detail' && renderSceneDetail()}
         {view === 'warnings' && renderWarnings()}
+        {view === 'requests' && renderRequests()}
         {view === 'versions' && renderVersions()}
       </Box>
 
@@ -632,14 +870,15 @@ export default function App() {
                   <Stack direction="row" alignItems="center" gap={1}>
                     <Box className="scene-number small">{scene.number}</Box>
                     <Typography fontWeight={750}>{scene.slug}</Typography>
+                    {scene.status === 'locked' && <Chip size="small" icon={<Lock />} label="锁定" />}
                   </Stack>
-                  <TextField label="故事时间" value={scene.storyTime} onChange={(event) => store.updateScene(scene.id, 'storyTime', event.target.value)} />
-                  <TextField select label="日夜" value={scene.dayNight} onChange={(event) => store.updateScene(scene.id, 'dayNight', event.target.value)}>
+                  <TextField label="故事时间" value={scene.storyTime} disabled={scene.status === 'locked'} onChange={(event) => store.updateScene(scene.id, 'storyTime', event.target.value)} />
+                  <TextField select label="日夜" value={scene.dayNight} disabled={scene.status === 'locked'} onChange={(event) => store.updateScene(scene.id, 'dayNight', event.target.value)}>
                     {dayNightOptions.map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
                   </TextField>
                   <Stack direction="row" gap={1}>
-                    <Button disabled={index === 0} onClick={() => store.moveScene(scene.id, -1)}>前移</Button>
-                    <Button disabled={index === state.script.scenes.length - 1} onClick={() => store.moveScene(scene.id, 1)}>后移</Button>
+                    <Button disabled={index === 0 || scene.status === 'locked'} onClick={() => store.moveScene(scene.id, -1)}>前移</Button>
+                    <Button disabled={index === state.script.scenes.length - 1 || scene.status === 'locked'} onClick={() => store.moveScene(scene.id, 1)}>后移</Button>
                   </Stack>
                 </Paper>
               ))}
@@ -665,12 +904,64 @@ export default function App() {
             <kbd>⇧⌘/Ctrl + Z</kbd><span>重做</span>
             <kbd>⌘/Ctrl + F</kbd><span>聚焦全文搜索</span>
             <kbd>⌘/Ctrl + Enter</kbd><span>保存版本</span>
-            <kbd>Alt + ↑ / ↓</kbd><span>移动当前场景</span>
+            <kbd>Alt + ↑ / ↓</kbd><span>移动当前场景（锁定场次除外）</span>
             <kbd>← / →</kbd><span>前后切换场景</span>
             <kbd>Esc</kbd><span>清除搜索</span>
           </Box>
         </DialogContent>
         <DialogActions><Button onClick={() => setShortcutOpen(false)}>关闭</Button></DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={reviewDialog !== null}
+        onClose={() => { setReviewDialog(null); setReviewerName(''); setRejectReason('') }}
+        fullWidth
+        maxWidth="sm"
+      >
+        {reviewDialogRequest && (
+          <>
+            <DialogTitle>{reviewDialog?.mode === 'approve' ? '批准锁定场次修改' : '驳回锁定场次修改'}</DialogTitle>
+            <DialogContent>
+              <Stack gap={2} mt={.5}>
+                <Box>
+                  <Typography fontWeight={700}>场景 {reviewDialogRequest.sceneNumber} · {reviewDialogRequest.sceneSlug}</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    {reviewDialogRequest.submittedBy} 提交，共 {reviewDialogRequest.patches.length} 项字段：{reviewDialogRequest.patches.map((patch) => patch.label).join('、')}
+                  </Typography>
+                </Box>
+                {reviewDialog?.mode === 'approve' ? (
+                  <Alert severity="info">批准后改动立即写入工作稿，并按新值重算角色、道具、服装与时间线检查结果。</Alert>
+                ) : (
+                  <Alert severity="warning">驳回后整条申请丢弃，工作稿保持改前值；请填写驳回说明，提交人可见。</Alert>
+                )}
+                <TextField
+                  label="审阅人"
+                  placeholder="审阅人"
+                  value={reviewerName}
+                  onChange={(event) => setReviewerName(event.target.value)}
+                  autoFocus
+                />
+                {reviewDialog?.mode === 'reject' && (
+                  <TextField
+                    label="驳回说明"
+                    required
+                    multiline
+                    minRows={3}
+                    placeholder="例如：道具与第 3 场连戏不一致，需保持银色录音笔"
+                    value={rejectReason}
+                    onChange={(event) => setRejectReason(event.target.value)}
+                  />
+                )}
+              </Stack>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => { setReviewDialog(null); setReviewerName(''); setRejectReason('') }}>取消</Button>
+              {reviewDialog?.mode === 'approve'
+                ? <Button variant="contained" color="success" startIcon={<CheckCircle />} onClick={confirmReviewDialog}>批准并写入工作稿</Button>
+                : <Button variant="contained" color="error" startIcon={<Block />} disabled={!rejectReason.trim()} onClick={confirmReviewDialog}>驳回并丢弃</Button>}
+            </DialogActions>
+          </>
+        )}
       </Dialog>
     </Box>
   )

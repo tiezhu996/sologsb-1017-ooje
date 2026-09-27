@@ -1,6 +1,33 @@
 export type RevisionColor = 'white' | 'blue' | 'pink' | 'yellow' | 'green' | 'goldenrod' | 'buff' | 'salmon' | 'cherry'
 export type WarningStatus = 'pending' | 'accepted' | 'ignored'
 export type WarningType = 'character' | 'prop' | 'wardrobe' | 'timeline'
+export type ChangeRequestStatus = 'pending' | 'approved' | 'rejected'
+
+/** Fields of a locked scene that can be proposed through a change request. */
+export type ScenePatchField = 'number' | 'slug' | 'synopsis' | 'intExt' | 'location' | 'dayNight' | 'storyTime' | 'pageLength' | 'revision' | 'reason' | 'characterIds' | 'propIds' | 'costumes'
+
+export interface ScenePatch {
+  field: ScenePatchField
+  label: string
+  before: string
+  after: string
+  value: Scene[keyof Scene]
+}
+
+export interface ChangeRequest {
+  id: string
+  sceneId: string
+  sceneNumber: string
+  sceneSlug: string
+  patches: ScenePatch[]
+  submittedBy: string
+  note: string
+  createdAt: string
+  status: ChangeRequestStatus
+  reviewedBy: string
+  reviewedAt: string
+  rejectReason: string
+}
 
 export interface Character {
   id: string
@@ -87,6 +114,7 @@ export interface ContinuityState {
   script: Script
   reviews: Record<string, WarningReview>
   versions: Version[]
+  changeRequests: ChangeRequest[]
   updatedAt: string
 }
 
